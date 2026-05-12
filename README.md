@@ -96,7 +96,7 @@ inside a `loom-otp` process. For example, `proc/self`, `receive!`, `monitor`, an
 - [Troubleshooting](doc/TROUBLESHOOTING.md) — common errors, likely causes, and fixes.
 - [Design](doc/DESIGN.md) — implementation architecture and process model.
 - [Compatibility test gaps](doc/OTPLIKE_COMPAT_TEST_GAPS.md) — parity notes for the otplike test suite.
-- [Benchmark comparison](bench/benchmark-comparison.md) — measured comparisons with otplike.
+- [Benchmark comparison](bench/benchmark-comparison.md) — measured comparisons with Elixir/BEAM, loom-otp, otplike-compat, and otplike.
 
 ## API map
 

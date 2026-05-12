@@ -131,10 +131,20 @@ run_benchmark "otplike-compat" "G1GC" "$RESULTS_DIR/otplike-compat-g1gc.txt"
 run_benchmark "otplike-compat" "ZGC" "$RESULTS_DIR/otplike-compat-zgc.txt"
 run_benchmark "otplike-compat" "Shenandoah" "$RESULTS_DIR/otplike-compat-shenandoah.txt"
 
-# otplike with each GC
-run_benchmark "otplike" "G1GC" "$RESULTS_DIR/otplike-g1gc.txt"
-run_benchmark "otplike" "ZGC" "$RESULTS_DIR/otplike-zgc.txt"
-run_benchmark "otplike" "Shenandoah" "$RESULTS_DIR/otplike-shenandoah.txt"
+# Original otplike with each GC. This requires an external otplike checkout
+# because this repository only contains the loom-otp compatibility layer.
+if [ -n "${OTPLIKE_BENCH_DIR:-}" ] || [ -d "$SCRIPT_DIR/otplike" ]; then
+    run_benchmark "otplike" "G1GC" "$RESULTS_DIR/otplike-g1gc.txt"
+    run_benchmark "otplike" "ZGC" "$RESULTS_DIR/otplike-zgc.txt"
+    run_benchmark "otplike" "Shenandoah" "$RESULTS_DIR/otplike-shenandoah.txt"
+else
+    echo "=============================================="
+    echo "Skipping original otplike benchmarks"
+    echo "Set OTPLIKE_BENCH_DIR to an otplike checkout to rerun them."
+    echo "Existing historical result files are left untouched."
+    echo "=============================================="
+    echo ""
+fi
 
 TOTAL_END=$(date +%s)
 TOTAL_DURATION=$((TOTAL_END - TOTAL_START))
@@ -151,5 +161,5 @@ if [ "$DRY_RUN" = false ]; then
     echo ""
     echo "Generated files:"
     ls -la "$RESULTS_DIR"/*.txt
-    push "benchmark complete"
+    echo "benchmark complete"
 fi

@@ -23,9 +23,9 @@
                                   [org.clojure/math.combinatorics "0.1.6"]
                                   [org.clojure/core.async "1.6.681"]]}
              
-             ;; G1GC benchmarks (default)
-             :bench {:source-paths ["bench"]
-                     :main loom-otp.bench.runner
+              ;; G1GC benchmarks (default)
+              :bench {:source-paths ["bench/src/loom_otp_native"]
+                      :main loom-otp.bench.runner
                      :jvm-opts ["-Xmx8g" "-Xms8g"
                                 "-Xss512k"
                                 "-XX:+UseG1GC"
@@ -35,9 +35,9 @@
                                 "-Djdk.virtualThreadScheduler.parallelism=22"
                                 "-Djdk.virtualThreadScheduler.maxPoolSize=256"]}
              
-             ;; ZGC benchmarks (ZGC is generational by default since JDK 23)
-             :bench-zgc {:source-paths ["bench"]
-                         :main loom-otp.bench.runner
+              ;; ZGC benchmarks (ZGC is generational by default since JDK 23)
+              :bench-zgc {:source-paths ["bench/src/loom_otp_native"]
+                          :main loom-otp.bench.runner
                          :jvm-opts ["-Xmx8g" "-Xms8g"
                                     "-Xss512k"
                                     "-XX:+UseZGC"
@@ -45,9 +45,9 @@
                                     "-Djdk.virtualThreadScheduler.parallelism=22"
                                     "-Djdk.virtualThreadScheduler.maxPoolSize=256"]}
              
-             ;; Shenandoah benchmarks
-             :bench-shenandoah {:source-paths ["bench"]
-                                :main loom-otp.bench.runner
+              ;; Shenandoah benchmarks
+              :bench-shenandoah {:source-paths ["bench/src/loom_otp_native"]
+                                 :main loom-otp.bench.runner
                                 :jvm-opts ["-Xmx8g" "-Xms8g"
                                            "-Xss512k"
                                            "-XX:+UseShenandoahGC"
@@ -55,9 +55,9 @@
                                            "-Djdk.virtualThreadScheduler.parallelism=22"
                                            "-Djdk.virtualThreadScheduler.maxPoolSize=256"]}
              
-             ;; otplike compat layer - G1GC (default)
-             :otplike-bench {:source-paths ["bench"]
-                             :main otplike.bench.runner
+              ;; otplike compat layer - G1GC (default)
+              :otplike-bench {:source-paths ["bench/src/loom_otp_otplike_compat"]
+                              :main otplike.bench.runner
                              :jvm-opts ["-Xmx8g" "-Xms8g"
                                         "-Xss512k"
                                         "-XX:+UseG1GC"
@@ -67,9 +67,9 @@
                                         "-Djdk.virtualThreadScheduler.parallelism=22"
                                         "-Djdk.virtualThreadScheduler.maxPoolSize=256"]}
              
-             ;; otplike compat layer - ZGC
-             :otplike-bench-zgc {:source-paths ["bench"]
-                                 :main otplike.bench.runner
+              ;; otplike compat layer - ZGC
+              :otplike-bench-zgc {:source-paths ["bench/src/loom_otp_otplike_compat"]
+                                  :main otplike.bench.runner
                                  :jvm-opts ["-Xmx8g" "-Xms8g"
                                             "-Xss512k"
                                             "-XX:+UseZGC"
@@ -77,9 +77,9 @@
                                             "-Djdk.virtualThreadScheduler.parallelism=22"
                                             "-Djdk.virtualThreadScheduler.maxPoolSize=256"]}
              
-             ;; otplike compat layer - Shenandoah
-             :otplike-bench-shenandoah {:source-paths ["bench"]
-                                        :main otplike.bench.runner
+              ;; otplike compat layer - Shenandoah
+              :otplike-bench-shenandoah {:source-paths ["bench/src/loom_otp_otplike_compat"]
+                                         :main otplike.bench.runner
                                         :jvm-opts ["-Xmx8g" "-Xms8g"
                                                    "-Xss512k"
                                                    "-XX:+UseShenandoahGC"

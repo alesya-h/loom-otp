@@ -22,8 +22,11 @@
 
 set -e
 
-# Get the directory where the script is located
+# Get the directory where the script is located and the repository root.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ELIXIR_DIR="$SCRIPT_DIR/src/elixir"
+OTPLIKE_DIR="${OTPLIKE_BENCH_DIR:-$SCRIPT_DIR/otplike}"
 
 # Defaults
 GC="G1GC"
@@ -93,28 +96,33 @@ echo ""
 # Run Elixir benchmarks
 if [ "$IMPL" = "all" ] || [ "$IMPL" = "elixir" ]; then
     echo "=== ELIXIR/BEAM BENCHMARKS ==="
-    cd "$SCRIPT_DIR/bench_elixir" && mix run -e "BenchElixir.Runner.main($ELIXIR_ARGS)"
+    cd "$ELIXIR_DIR" && mix run -e "BenchElixir.Runner.main($ELIXIR_ARGS)"
     echo ""
 fi
 
 # Run loom-otp benchmarks
 if [ "$IMPL" = "all" ] || [ "$IMPL" = "loom-otp" ]; then
     echo "=== LOOM-OTP BENCHMARKS (GC: $GC) ==="
-    cd "$SCRIPT_DIR/loom-otp" && lein with-profile "$LOOM_PROFILE" run "$BENCHMARK"
+    cd "$ROOT_DIR" && lein with-profile "$LOOM_PROFILE" run "$BENCHMARK"
     echo ""
 fi
 
 # Run otplike-compat benchmarks
 if [ "$IMPL" = "all" ] || [ "$IMPL" = "otplike-compat" ]; then
     echo "=== OTPLIKE VIA LOOM-OTP COMPAT LAYER BENCHMARKS (GC: $GC) ==="
-    cd "$SCRIPT_DIR/loom-otp" && lein with-profile "$OTPLIKE_COMPAT_PROFILE" run "$BENCHMARK"
+    cd "$ROOT_DIR" && lein with-profile "$OTPLIKE_COMPAT_PROFILE" run "$BENCHMARK"
     echo ""
 fi
 
 # Run otplike benchmarks
 if [ "$IMPL" = "all" ] || [ "$IMPL" = "otplike" ]; then
     echo "=== OTPLIKE BENCHMARKS (GC: $GC) ==="
-    cd "$SCRIPT_DIR/otplike" && lein with-profile "$OTPLIKE_PROFILE" run "$BENCHMARK"
+    if [ -d "$OTPLIKE_DIR" ]; then
+        cd "$OTPLIKE_DIR" && lein with-profile "$OTPLIKE_PROFILE" run "$BENCHMARK"
+    else
+        echo "SKIPPED: original otplike benchmark project not found."
+        echo "Set OTPLIKE_BENCH_DIR to an otplike checkout to rerun original otplike benchmarks."
+    fi
     echo ""
 fi
 
