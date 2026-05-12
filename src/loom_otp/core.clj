@@ -10,11 +10,14 @@
    ;; Main API - loom-otp.process provides most things:
    ;; - spawn, spawn-link, spawn-opt - create processes
    ;; - self, send - current process and messaging
-   ;; - exit - terminate processes
-   ;; - link, unlink - bidirectional links
-   ;; - monitor, demonitor - unidirectional monitors  
+   ;; - exit - terminate processes or send exit signals
+   ;; - monitor, demonitor - unidirectional monitors
    ;; - receive!, selective-receive! - receive messages (functions)
    ;; - alive?, processes, process-info, register
+   ;;
+   ;; Native links are created at spawn time with spawn-link or
+   ;; spawn-opt {:link true}. The otplike compatibility layer exposes
+   ;; explicit link/unlink functions for migration use.
    
    ;; For pattern-matching receive:
    ;; - loom-otp.process.match for receive!, selective-receive! macros

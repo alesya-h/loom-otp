@@ -1,308 +1,346 @@
-# loom-otp Design Document
+# loom-otp design
 
-Erlang/OTP-style actor concurrency for Clojure using JVM virtual threads (Project Loom).
+`loom-otp` implements Erlang/OTP-style actor concurrency for Clojure on JVM
+virtual threads. It provides process spawning, message passing, links, monitors,
+registered names, `gen_server`, supervisors, timers, tracing, and an otplike
+compatibility layer.
 
-## Overview
+This document describes the current implementation architecture. For user-facing
+usage, start with [Getting started](GETTING_STARTED.md) and [API reference](API.md).
 
-loom-otp provides processes, message passing, links, monitors, gen_server, and supervisors. Unlike [otplike](https://github.com/suprematic/otplike) which uses core.async, loom-otp uses virtual threads where blocking is cheap and natural.
+## Goals
 
-**Key differences from otplike:**
-- Virtual threads instead of go blocks
-- Single `receive!` (always blocking) instead of `receive!`/`receive!!`
-- No `async`/`await!` - just block directly
-- Links only via `spawn-link` (no explicit `link`/`unlink` API)
-- Selective receive supported via `selective-receive!`
+- Make blocking actor-style code natural on Java 21+ virtual threads.
+- Keep the main process API small: spawn, send, receive, link at spawn time,
+  monitor, and inspect.
+- Preserve important OTP semantics: links, monitors, trap exits, restart
+  strategies, and server callbacks.
+- Provide an otplike compatibility layer for migration while keeping native
+  `loom-otp` APIs straightforward.
+
+## Non-goals
+
+- Full Erlang VM compatibility.
+- Distribution across JVM nodes.
+- A core.async implementation. The compatibility layer avoids requiring callers
+  to use go blocks.
+- Public access to every low-level process table and mailbox operation.
 
 ## Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
-│                      APPLICATION LAYER                          │
-│  supervisor - Supervision trees, restart strategies             │
+│ Application layer                                                │
+│                                                                 │
+│  loom-otp.supervisor       Supervision trees and restart logic   │
 ├─────────────────────────────────────────────────────────────────┤
-│                      BEHAVIOR LAYER                             │
-│  gen-server - Generic server pattern                            │
-│  timer - Delayed/periodic operations                            │
+│ Behavior layer                                                   │
+│                                                                 │
+│  loom-otp.gen-server       Stateful request/cast/info servers    │
+│  loom-otp.timer            Process-backed timers                 │
+│  loom-otp.vfuture          Virtual-thread futures                │
 ├─────────────────────────────────────────────────────────────────┤
-│                      CORE PROCESS LAYER                         │
-│  process - Spawning, messaging, monitors, receive               │
-│  process.spawn - Process lifecycle (control + user threads)     │
-│  process.link - Bidirectional links (stored per-process)        │
-│  process.monitor - Unidirectional monitors                      │
-│  process.exit - Exit handling                                   │
+│ Public process layer                                             │
+│                                                                 │
+│  loom-otp.process          Main process API                      │
+│  loom-otp.process.match    Pattern receive macros                │
+│  loom-otp.registry         Registered names                      │
+│  loom-otp.trace            Global trace handler                  │
 ├─────────────────────────────────────────────────────────────────┤
-│                      FOUNDATION LAYER                           │
-│  mailbox - Message queue with watch-based notification          │
-│  context-mailbox - [ctx msg] pairs for distributed tracing      │
-│  registry - Process registration by name                        │
-│  state - Global state management (mount.lite)                   │
-│  types - Pid, TRef wrapper types                                │
-│  trace - Event tracing infrastructure                           │
+│ Process implementation layer                                     │
+│                                                                 │
+│  process.spawn             Virtual-thread lifecycle              │
+│  process.core              Current pid, send, exit signals       │
+│  process.receive           FIFO and predicate receive functions  │
+│  process.link              Bidirectional links                   │
+│  process.monitor           Monitors and :DOWN delivery           │
+│  process.exit              Exit exception and reason helpers     │
+├─────────────────────────────────────────────────────────────────┤
+│ Foundation layer                                                 │
+│                                                                 │
+│  state                     mount.lite-managed global state       │
+│  mailbox                   Blocking mailbox implementation       │
+│  context-mailbox           [context message] mailbox wrapper     │
+│  types                     TRef and helper predicates            │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Process Model
+The compatibility layer under `loom-otp.otplike.*` wraps the native layers and
+adapts return values, names, and selected semantics to otplike-style APIs.
 
-Each process has two virtual threads:
+## Runtime state
 
-```
-┌─────────────────── Process ───────────────────┐
-│                                               │
-│  ┌─────────────────┐  ┌───────────────────┐   │
-│  │ Control Thread  │  │   User Thread     │   │
-│  │                 │  │                   │   │
-│  │ • Sets up links │  │ • Runs user code  │   │
-│  │ • Starts user   │  │ • Calls receive!  │   │
-│  │ • Handles exits │  │ • Pattern matches │   │
-│  │ • Runs cleanup  │  │                   │   │
-│  │                 │  │ Notifies control  │   │
-│  │ Orchestrates    │  │ on termination    │   │
-│  │ lifecycle       │  │                   │   │
-│  └─────────────────┘  └───────────────────┘   │
-│                                               │
-│  Shared: mailbox, control, flags, exit-reason │
-└───────────────────────────────────────────────┘
-```
-
-### Process Lifecycle
-
-```
-spawn-process (caller's thread):
-  1. Create process with promises for coordination
-  2. Add to process table, register name
-  3. Start control thread (virtual)
-  4. Wait for :spawned promise
-  5. Return pid
-
-control-thread:
-  1. Deliver :control-thread promise
-  2. Set up link if requested (may fail with :noproc)
-  3. Start user thread (virtual)
-  4. Wait for :user-thread promise
-  5. Deliver :spawned promise
-  6. Loop: handle signals via cmb/receive!
-     - [:exit from reason] → handle-exit-signal!, maybe interrupt user
-     - [:user-terminated-return value] → set exit-reason
-     - [:user-terminated-throw exception] → set exit-reason
-     - [:user-terminated-interrupted] → exit-reason already set
-  7. Cleanup: notify links/monitors, unregister, remove from table
-
-user-thread:
-  1. Deliver :user-thread promise
-  2. Run user function
-  3. Send termination signal to control thread
-```
-
-### Process State
+Global state is managed by `mount.lite` in `loom-otp.state`.
 
 ```clojure
-{:pid             Pid                    ; Unique identifier
- :mailbox         Atom<Queue>            ; User messages [ctx msg]
- :control         Atom<Queue>            ; Control signals [ctx signal]
- :exit-reason     Promise                ; Delivered on exit (write-once)
- :message-context Atom<Map>              ; Context for distributed tracing
- :last-control-ctx Atom<Map>             ; Context from last exit signal
- :flags           Atom<{:trap-exit bool}>
- :links           Atom<#{pid-ids}>       ; Linked process ids
- :user-thread     Promise<Thread>        ; For interrupt
- :control-thread  Promise<Thread>
- :spawned         Promise<bool>}         ; Coordination
+{:processes        ConcurrentHashMap ; Thread -> process map
+ :monitors         ConcurrentHashMap ; ref-id -> monitor info
+ :registry-forward ConcurrentHashMap ; name -> Thread
+ :registry-reverse ConcurrentHashMap ; Thread -> name
+ :trace-fn         Atom              ; trace handler or nil
+ :ref-counter      AtomicLong        ; monitor/timer ref ids
+ :cleanup-thread   Atom}             ; delayed cleanup worker
 ```
 
-## Exit Reasons
+Start state with `loom-otp.core/start!` and stop it with
+`loom-otp.core/stop!`.
 
-| Scenario | Exit Reason |
-|----------|-------------|
-| User function returns `value` | `[:normal value]` |
-| User calls `(exit/exit reason)` | `reason` |
-| User throws exception | `[:exception (Throwable->map e)]` |
-| spawn-link to non-existent process | `:noproc` |
-| Exit signal with reason R (not trapped) | `R` |
-| Exit signal with `:kill` | `:killed` |
+### Process map
 
-Normal exits are `[:normal value]` or bare `:normal`. The `normal-exit-reason?` helper checks both forms.
+Each process is represented by one Java virtual thread plus metadata:
+
+```clojure
+{:mailbox          Atom<Queue<[ctx msg]>>
+ :exit-reason      Atom<nil | reason>
+ :cleanup-after    Atom<nil | Instant>
+ :user-result      Promise
+ :message-context  Atom<Map>
+ :last-control-ctx Atom<Map>
+ :flags            Atom<{:trap-exit boolean}>
+ :links            Atom<#{Thread}>
+ :ex->reason-fn    Function}
+```
+
+Pids are the virtual `Thread` objects themselves. There is no pid wrapper type
+in the native API.
+
+Exited processes are marked for delayed cleanup. `state/get-proc` hides fully
+exited processes, while lower-level cleanup code can still see raw entries until
+the cleanup delay expires.
+
+## Process lifecycle
+
+```text
+caller thread
+  │
+  ├─ spawn/spawn-opt
+  │   ├─ capture caller message context
+  │   ├─ create process map
+  │   ├─ start virtual thread
+  │   └─ wait until setup succeeds or fails
+  │
+virtual process thread
+  │
+  ├─ add self to process table
+  ├─ register name, if requested
+  ├─ create link to parent, if requested
+  ├─ signal spawn completion
+  ├─ run bound user function
+  ├─ record normal return, explicit exit, interrupt, or exception
+  ├─ notify linked processes and monitors
+  ├─ remove owned monitors and links
+  ├─ unregister name
+  └─ mark process for delayed cleanup
+```
+
+`bound-fn*` preserves dynamic bindings from the caller in spawned process
+functions.
+
+## Message passing
+
+`loom-otp.process/send` resolves the destination through `loom-otp.registry`.
+The destination can be a pid or registered name.
+
+Messages are stored internally as `[ctx msg]` pairs. `ctx` is the sender's
+current message context. When a process receives a message, the context is merged
+into the receiver's process context. That context is then propagated through
+future sends, exits, and monitor notifications.
+
+### FIFO receive
+
+`loom-otp.process.receive/receive!` removes the next mailbox entry in FIFO order
+and returns the unwrapped message. The pattern macro
+`loom-otp.process.match/receive!` matches that message with `core.match`.
+
+If the next message does not match any macro clause, the macro throws. The
+message has already been removed because FIFO receive has consumed it.
+
+### Selective receive
+
+`selective-receive!` scans the mailbox for the first matching message. It removes
+that entry and leaves non-matching entries in their original order.
+
+For the macro form, selection is pattern-based. Clause bodies do not participate
+in selection.
+
+## Exit reasons
+
+Exit reasons are plain Clojure values.
+
+| Scenario | Exit reason |
+| --- | --- |
+| User function returns normally | `:normal` |
+| User calls `(exit/exit reason)` or `(proc/exit reason)` | `reason` |
+| User function throws an uncaught exception | `[:exception throwable]` by default |
+| `:ex->reason-fn` spawn option converts an exception | Function return value |
+| Link setup fails because target is gone | `:noproc` |
+| Process receives untrappable `:kill` | `:killed` |
+
+The normal return value of a process is delivered to the process's internal
+`:user-result` promise. It is not part of the native process exit reason.
 
 ## Links
 
-Bidirectional relationships for fault propagation. Stored in each process's `:links` atom.
+Links are bidirectional relationships used for fault propagation.
 
-**Key properties:**
-- Created only via `spawn-link` or `spawn-opt {:link true}`
-- No explicit `link`/`unlink` public API
-- Bidirectional: if A links to B, both have each other in `:links`
-- On exit: linked processes receive exit signals
+Native links are created at spawn time:
 
-**Exit signal handling:**
+- `proc/spawn-link`
+- `proc/spawn-link!`
+- `proc/spawn-opt` with `{:link true}`
 
-| Receiver's trap-exit | Reason = :normal | Reason = :kill | Reason = other |
-|---------------------|------------------|----------------|----------------|
-| false | Ignored | Dies with :killed | Dies with reason |
-| true | Receives [:EXIT pid reason] | Dies with :killed | Receives [:EXIT pid reason] |
+The native public API intentionally does not expose general `link` and `unlink`
+functions. The otplike compatibility layer exposes them for compatibility.
+
+### Link signal handling
+
+When a process exits, cleanup sends exit signals to linked processes.
+
+| Receiver `:trap-exit` | Reason `:normal` | Reason `:kill` | Any other reason |
+| --- | --- | --- | --- |
+| `false` | Ignored | Exit with `:killed` | Exit with reason |
+| `true` | Receive `[:EXIT from reason]` | Exit with `:killed` | Receive `[:EXIT from reason]` |
 
 ## Monitors
 
-Unidirectional observation without coupling.
+Monitors are one-way observations. They do not propagate failure.
 
-**Key properties:**
-- One-shot: fires once, then removed
-- Always delivers `:DOWN` message (no trap flag needed)
-- Safe for non-existent targets (immediate `:noproc`)
-- Stackable: multiple monitors to same target allowed
-
-**Message format:**
 ```clojure
 [:DOWN ref :process target reason]
 ```
 
-## Message Passing
+Properties:
 
-### Send (`send`)
+- A monitor fires once and is removed.
+- Monitoring a missing target sends an immediate `:DOWN` with `:noproc`.
+- Multiple monitors to the same target are allowed.
+- Monitors are cleaned up when the watcher exits.
 
-```clojure
-(send dest message)  ; Returns true if delivered, false if process not found
-```
+## Registry
 
-Messages are wrapped with sender's context for distributed tracing.
+The registry maintains two maps:
 
-### Receive (`receive!`)
+- name -> pid
+- pid -> name
 
-Pattern-matching receive with optional timeout:
+This enforces one name per pid and one pid per name. Registrations are removed
+during process cleanup.
 
-```clojure
-(receive!
-  [:hello name] (println "Hello" name)
-  [:exit reason] (handle-exit reason)
-  (after 1000 :timeout))
-```
+## `gen_server`
 
-### Selective Receive (`selective-receive!`)
+`loom-otp.gen-server` runs a server loop inside a process.
 
-Scans mailbox for first matching message:
+Message types:
 
-```clojure
-(selective-receive!
-  [:priority msg] (handle-priority msg)
-  (after 500 :no-priority))
-```
+- `[::call [ref caller-pid] request]` for synchronous calls
+- `[::cast request]` for asynchronous casts
+- any other message for `handle-info`
+- `:timeout` synthetic info message after a callback timeout
 
-## State Management
+`call` monitors the server, sends a call message, and selectively waits for
+either a reply or a `:DOWN`. It throws on timeout or server death.
 
-Uses [mount.lite](https://github.com/aroemers/mount-lite) for lifecycle management.
+Callbacks return OTP-style vectors such as `[:reply response new-state]`,
+`[:noreply new-state]`, and `[:stop reason new-state]`. See [API reference](API.md)
+for the full table.
 
-```clojure
-(require '[mount.lite :as mount])
+## Supervisors
 
-(mount/start)  ; Initialize system
-;; ... use processes ...
-(mount/stop)   ; Terminate all processes
-```
-
-### Global State
+`loom-otp.supervisor` starts a supervisor process that traps exits and starts
+children with `proc/spawn-link`. Children are stored as ordered entries:
 
 ```clojure
-{:processes   Atom<{pid-id -> process-map}>
- :monitors    Atom<{ref-id -> monitor-info}>
- :registry    Atom<{:forward {name -> pid}, :reverse {pid-id -> name}}>
- :trace-fn    Atom<handler-fn>
- :pid-counter AtomicLong
- :ref-counter AtomicLong}
+{:spec child-spec
+ :pid  child-pid}
 ```
 
-Note: Links are stored per-process, not globally.
+On `[:EXIT child reason]`, the supervisor:
 
-### Parallel Testing
+1. finds the child entry
+2. checks the child restart policy
+3. checks restart intensity
+4. applies the configured strategy
+5. exits with `:max-intensity` or another reason if restart cannot proceed
 
-```clojure
-(use-fixtures :each
-  (fn [f]
-    (mount/start)
-    (try (f) (finally (mount/stop)))))
-```
+Supported strategies:
 
-## Public API
+- `:one-for-one`
+- `:one-for-all`
+- `:rest-for-one`
 
-### loom-otp.process
+See [Supervision guide](SUPERVISION.md) for examples and operational guidance.
 
-| Function | Description |
-|----------|-------------|
-| `spawn`, `spawn-link`, `spawn-opt` | Create processes |
-| `spawn!`, `spawn-link!`, `spawn-opt!` | Macro versions (wrap body in fn) |
-| `spawn-trap`, `spawn-trap!` | Spawn with trap-exit enabled |
-| `self` | Current process pid |
-| `send` | Send message |
-| `exit` | Exit self or send exit signal to another |
-| `monitor`, `demonitor` | Manage monitors |
-| `register` | Register name for process |
-| `alive?`, `processes`, `process-info` | Introspection |
-| `receive!`, `selective-receive!` | Receive messages (see process.match) |
+## Timers
 
-### loom-otp.process.match
+Timers are processes that sleep using `receive!` with a timeout. A cancel message
+prevents the timeout branch from firing.
 
-| Macro | Description |
-|-------|-------------|
-| `receive!` | Pattern-matching receive with optional timeout |
-| `selective-receive!` | Scan mailbox for matching message |
+Timer defaults:
 
-### loom-otp.gen-server
+- one-shot timers are unlinked by default
+- interval timers are linked by default
+- `:catch-all true` catches callback exceptions and lets interval timers
+  continue
 
-| Function | Description |
-|----------|-------------|
-| `start`, `start-link` | Start server |
-| `call`, `cast` | Send requests |
-| `reply` | Explicit reply from handle-call |
-| `stop` | Stop server |
-
-### loom-otp.supervisor
-
-| Function | Description |
-|----------|-------------|
-| `start-link` | Start supervisor |
-| `start-child` | Add child dynamically |
-| `terminate-child` | Stop a child |
-| `which-children` | List children |
-
-### loom-otp.timer
-
-| Function | Description |
-|----------|-------------|
-| `send-after` | Send message after delay |
-| `exit-after`, `kill-after` | Send exit signal after delay |
-| `apply-after` | Call function after delay |
-| `send-interval`, `apply-interval` | Periodic operations |
-| `cancel` | Cancel timer |
-| `read-timer` | Get remaining time |
-
-### loom-otp.trace
-
-| Function | Description |
-|----------|-------------|
-| `trace` | Set trace handler |
-| `untrace` | Remove trace handler |
+Intervals schedule the next fire from the previous target fire time, not from the
+end of callback execution. This keeps intervals closer to the requested cadence
+when callback execution is shorter than the interval.
 
 ## Tracing
 
-```clojure
-(trace/trace (fn [event]
-               (println (:event event) (:pid event))))
+`loom-otp.trace/trace` installs a global handler. Internal code emits event maps
+for operations such as spawn, send, exit signals, and process exit.
 
-;; Events: :spawn, :exit, :exit-signal, :send
-```
-
-## Types
+Each emitted event receives:
 
 ```clojure
-(require '[loom-otp.types :as t])
-
-(t/pid? x)      ; Check if Pid
-(t/ref? x)      ; Check if TRef
-(t/->pid n)     ; Create Pid from number
-(t/->ref n)     ; Create TRef from number
-(t/pid->id pid) ; Extract number from Pid (or return number if already)
+{:event event-type
+ :timestamp current-time-ms
+ ...event-specific-data}
 ```
 
-## Dependencies
+Trace handlers should be fast and should not throw. Exceptions from handlers are
+caught and ignored.
 
-- Clojure 1.12+
-- JDK 21+ (for virtual threads)
-- `org.clojure/core.match` - Pattern matching in receive
-- `functionalbytes/mount-lite` - State lifecycle management
+## Compatibility layer design
+
+The `loom-otp.otplike.*` namespaces adapt native behavior to otplike-style APIs:
+
+- `process/!` wraps native `send`.
+- `proc-fn` and `proc-defn` produce ordinary functions.
+- `async` executes immediately and captures value or exception.
+- `receive!!` maps to the same implementation as `receive!`.
+- `gen-server` and supervisor start APIs use tuple returns and async/bang
+  conventions.
+- Timers return a compatibility `TimerRef` wrapper.
+
+See [OTPLike compatibility](OTPLIKE_COMPATIBILITY.md) for migration details.
+
+## Concurrency and cleanup considerations
+
+- Process tables, monitor tables, and registry maps use `ConcurrentHashMap`.
+- Per-process links, flags, mailbox, and context are stored in atoms.
+- Spawning waits until registration and link setup complete, so callers do not
+  receive a pid before setup succeeds.
+- Process cleanup notifies links and monitors before unregistering and marking
+  the process for delayed cleanup.
+- `mount.lite` stop interrupts all live process threads and clears state.
+
+## Public vs implementation namespaces
+
+Documented application APIs live in:
+
+- `loom-otp.core`
+- `loom-otp.process`
+- `loom-otp.process.match`
+- `loom-otp.registry`
+- `loom-otp.gen-server`
+- `loom-otp.supervisor`
+- `loom-otp.timer`
+- `loom-otp.vfuture`
+- `loom-otp.trace`
+- `loom-otp.types`
+- `loom-otp.otplike.*`
+
+Other namespaces are implementation details unless a function is explicitly
+referenced by the public API documentation.
